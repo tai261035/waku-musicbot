@@ -21,6 +21,8 @@ const {
 const MAX_NODES = 10;
 const SUBMENU_TIMEOUT = 60_000;
 const MODAL_TIMEOUT = 120_000;
+const NODE_TEST_TIMEOUT_MS = 25_000;
+const NODE_TEST_ATTEMPTS = 2;
 const testedNodeSessions = new Map();
 
 function getBoolean(value) {
@@ -52,32 +54,56 @@ function findNextNodeId(nodes) {
 
 async function pingNode(host, port, password, secure) {
   const protocol = secure ? "https" : "http";
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
   const startedAt = Date.now();
+  const endpoint = `${protocol}://${host}:${port}/v4/info`;
+  let lastError = null;
 
-  try {
-    const response = await fetch(`${protocol}://${host}:${port}/v4/info`, {
-      headers: {
-        Authorization: password,
-      },
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  for (let attempt = 1; attempt <= NODE_TEST_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      NODE_TEST_TIMEOUT_MS
+    );
 
-    return {
-      success: true,
-      data: await response.json(),
-      latency: Date.now() - startedAt,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message,
-    };
-  } finally {
-    clearTimeout(timeout);
+    try {
+      const response = await fetch(endpoint, {
+        headers: {
+          Authorization: password,
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        return {
+          success: false,
+          error: `HTTP ${response.status}`,
+        };
+      }
+
+      return {
+        success: true,
+        data: await response.json(),
+        latency: Date.now() - startedAt,
+      };
+    } catch (error) {
+      lastError =
+        error?.name === "AbortError"
+          ? new Error(
+              `Connection timed out after ${NODE_TEST_TIMEOUT_MS / 1000}s`
+            )
+          : error;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (attempt < NODE_TEST_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    }
   }
+
+  return {
+    success: false,
+    error: lastError?.message || "Could not reach Lavalink.",
+  };
 }
 
 function parseNodeInput(value) {
@@ -622,13 +648,18 @@ async function replaceNode(client, nodeId, input, reportProgress) {
 async function reloadNodes(client, reportProgress) {
   client.isLavalinkReloading = true;
   try {
-    const configPath = path.resolve(__dirname, "..", "..", "config.js");
-    const devConfigPath = path.resolve(__dirname, "..", "..", "dev-config.js");
-    const sourcePath = fs.existsSync(devConfigPath)
-      ? devConfigPath
-      : configPath;
-    delete require.cache[require.resolve(sourcePath)];
-    let newConfig = require(sourcePath);
+    const root = path.resolve(__dirname, "..", "..");
+    for (const filename of ["dev-config.js", "config.js", "config.heroku.js"]) {
+      const candidate = path.join(root, filename);
+      if (!fs.existsSync(candidate)) continue;
+      delete require.cache[require.resolve(candidate)];
+    }
+
+    // Use the startup loader so Heroku can reload Config Vars without config.js.
+    const configLoaderPath = require.resolve("../../util/getConfig");
+    delete require.cache[configLoaderPath];
+    const getConfig = require("../../util/getConfig");
+    let newConfig = await getConfig();
     const persistedNodes = await client.getPersistedLavalinkNodes();
     if (persistedNodes !== null) {
       newConfig = {
@@ -712,7 +743,7 @@ async function reloadNodes(client, reportProgress) {
     return buildInfoEmbed(
       client,
       "#FF0000",
-      t("lavalink.reloadError", { error: error.message })
+      t("lavalink.reloadError", { error: error?.message || String(error) })
     );
   } finally {
     client.isLavalinkReloading = false;
